@@ -34,9 +34,7 @@ import org.bouncycastle.tls.TlsServerProtocol;
 
 /*
  * TODO[jsse] Known limitations (relative to SSLEngine javadoc): 1. The wrap() and unwrap() methods
- * are synchronized, so will not execute concurrently with each other. 2. Never delegates tasks i.e.
- * getDelegatedTasks() will always return null; CPU-intensive parts of the handshake will execute
- * during wrap/unwrap calls.
+ * are synchronized, so will not execute concurrently with each other.
  */
 class ProvSSLEngine
     extends SSLEngine
@@ -61,6 +59,8 @@ class ProvSSLEngine
     protected ProvSSLSessionHandshake handshakeSession = null;
 
     protected SSLException deferredException = null;
+
+    private DelegatedTask delegatedTask = null;
 
     protected ProvSSLEngine(ContextData contextData)
     {
@@ -249,7 +249,7 @@ class ProvSSLEngine
     @Override
     public synchronized Runnable getDelegatedTask()
     {
-        return null;
+        return null == delegatedTask ? null : delegatedTask.getTask();
     }
 
     @Override
@@ -285,6 +285,10 @@ class ProvSSLEngine
     @Override
     public synchronized SSLEngineResult.HandshakeStatus getHandshakeStatus()
     {
+        if (delegatedTask != null)
+        {
+            return HandshakeStatus.NEED_TASK;
+        }
         if (protocol != null)
         {
             if (protocol.getAvailableOutputBytes() > 0 || deferredException != null)
@@ -354,13 +358,14 @@ class ProvSSLEngine
     @Override
     public synchronized boolean isInboundDone()
     {
-        return closedEarly || (null != protocol && protocol.isClosed());
+        return closedEarly || (null == delegatedTask && null != protocol && protocol.isClosed());
     }
 
     @Override
     public synchronized boolean isOutboundDone()
     {
-        return closedEarly || (null != protocol && protocol.isClosed() && protocol.getAvailableOutputBytes() < 1);
+        return closedEarly || (null == delegatedTask && null != protocol && protocol.isClosed()
+            && protocol.getAvailableOutputBytes() < 1);
     }
 
     public synchronized void setBCHandshakeApplicationProtocolSelector(BCApplicationProtocolSelector<SSLEngine> selector)
@@ -451,7 +456,12 @@ class ProvSSLEngine
     {
         // TODO[jsse] Argument checks - see javadoc
 
-        final HandshakeStatus initialHandshakeStatus = getHandshakeStatus();
+        HandshakeStatus initialHandshakeStatus = getHandshakeStatus();
+
+        if (HandshakeStatus.NEED_TASK == initialHandshakeStatus)
+        {
+            return new SSLEngineResult(Status.OK, initialHandshakeStatus, 0, 0);
+        }
 
         if (isInboundDone())
         {
@@ -461,6 +471,11 @@ class ProvSSLEngine
         if (!initialHandshakeBegun)
         {
             beginHandshake();
+            initialHandshakeStatus = getHandshakeStatus();
+            if (HandshakeStatus.NEED_TASK == initialHandshakeStatus)
+            {
+                return new SSLEngineResult(Status.OK, initialHandshakeStatus, 0, 0);
+            }
         }
 
         switch (initialHandshakeStatus)
@@ -488,6 +503,12 @@ class ProvSSLEngine
             bytesConsumed = preview.getRecordSize();
             byte[] record = new byte[bytesConsumed];
             src.get(record);
+
+            if (HandshakeStatus.NEED_UNWRAP == initialHandshakeStatus)
+            {
+                this.delegatedTask = new DelegatedTask(record);
+                return new SSLEngineResult(Status.OK, HandshakeStatus.NEED_TASK, bytesConsumed, 0);
+            }
 
             protocol.offerInput(record, 0, record.length);
         }
@@ -528,15 +549,7 @@ class ProvSSLEngine
             }
         }
 
-        HandshakeStatus resultHandshakeStatus = getHandshakeStatus();
-        if (resultHandshakeStatus == HandshakeStatus.NOT_HANDSHAKING)
-        {
-            if (!returnedFinished && protocolPeer.isHandshakeComplete())
-            {
-                returnedFinished = true;
-                resultHandshakeStatus = HandshakeStatus.FINISHED;
-            }
-        }
+        HandshakeStatus resultHandshakeStatus = getResultHandshakeStatus(getHandshakeStatus());
 
         return new SSLEngineResult(getStatus(), resultHandshakeStatus, bytesConsumed, bytesProduced);
     }
@@ -545,6 +558,11 @@ class ProvSSLEngine
     public synchronized SSLEngineResult wrap(ByteBuffer[] srcs, int offset, int length, ByteBuffer dst)
         throws SSLException
     {
+        if (delegatedTask != null)
+        {
+            return new SSLEngineResult(Status.OK, HandshakeStatus.NEED_TASK, 0, 0);
+        }
+
         if (deferredException != null)
         {
             SSLException e = deferredException;
@@ -562,6 +580,10 @@ class ProvSSLEngine
         if (!initialHandshakeBegun)
         {
             beginHandshake();
+            if (delegatedTask != null)
+            {
+                return new SSLEngineResult(Status.OK, HandshakeStatus.NEED_TASK, 0, 0);
+            }
         }
 
         int bytesProduced = 0;
@@ -644,7 +666,8 @@ class ProvSSLEngine
                     assert numRead == bytesProduced;
                 }
 
-                return new SSLEngineResult(getStatus(), HandshakeStatus.NOT_HANDSHAKING, bytesConsumed, bytesProduced);
+                return new SSLEngineResult(getStatus(), getResultHandshakeStatus(HandshakeStatus.NOT_HANDSHAKING),
+                    bytesConsumed, bytesProduced);
             }
             catch (IOException e)
             {
@@ -658,12 +681,7 @@ class ProvSSLEngine
             return new SSLEngineResult(Status.OK, HandshakeStatus.NEED_UNWRAP, 0, bytesProduced);
         }
 
-        HandshakeStatus resultHandshakeStatus = HandshakeStatus.NOT_HANDSHAKING;
-        if (!returnedFinished && protocolPeer.isHandshakeComplete())
-        {
-            returnedFinished = true;
-            resultHandshakeStatus = HandshakeStatus.FINISHED;
-        }
+        HandshakeStatus resultHandshakeStatus = getResultHandshakeStatus(HandshakeStatus.NOT_HANDSHAKING);
 
         return new SSLEngineResult(getStatus(), resultHandshakeStatus, 0, bytesProduced);
     }
@@ -738,6 +756,30 @@ class ProvSSLEngine
         return dummySession;
     }
 
+    private synchronized void completeDelegatedTask(DelegatedTask task, SSLException exception)
+    {
+        if (this.delegatedTask == task)
+        {
+            this.delegatedTask = null;
+        }
+        if (null != exception)
+        {
+            this.deferredException = exception;
+        }
+    }
+
+    private HandshakeStatus getResultHandshakeStatus(HandshakeStatus handshakeStatus)
+    {
+        if (HandshakeStatus.NOT_HANDSHAKING == handshakeStatus && !returnedFinished && null != protocolPeer
+            && protocolPeer.isHandshakeComplete())
+        {
+            returnedFinished = true;
+            return HandshakeStatus.FINISHED;
+        }
+
+        return handshakeStatus;
+    }
+
     private RecordPreview getRecordPreview(ByteBuffer src)
         throws IOException
     {
@@ -779,5 +821,59 @@ class ProvSSLEngine
     private boolean hasInsufficientSpace(ByteBuffer[] dsts, int off, int len, int amount)
     {
         return getTotalRemaining(dsts, off, len, amount) < amount;
+    }
+
+    private final class DelegatedTask
+        implements Runnable
+    {
+        private final byte[] record;
+        private boolean handedOut = false;
+        private boolean started = false;
+
+        DelegatedTask(byte[] record)
+        {
+            this.record = record;
+        }
+
+        Runnable getTask()
+        {
+            if (handedOut)
+            {
+                return null;
+            }
+
+            handedOut = true;
+            return this;
+        }
+
+        public void run()
+        {
+            synchronized (this)
+            {
+                if (started)
+                {
+                    return;
+                }
+
+                started = true;
+            }
+
+            SSLException exception = null;
+            try
+            {
+                // Keep the engine monitor free while the delegated handshake work runs.
+                protocol.offerInput(record, 0, record.length);
+            }
+            catch (IOException e)
+            {
+                exception = new SSLException(e);
+            }
+            catch (RuntimeException e)
+            {
+                exception = new SSLException(e);
+            }
+
+            completeDelegatedTask(this, exception);
+        }
     }
 }
